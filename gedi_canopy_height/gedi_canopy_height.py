@@ -1,10 +1,14 @@
 import logging
+import os
 import posixpath
-from os import makedirs, system
+from os import makedirs
 from os.path import exists, dirname, join, expanduser, abspath
 from shutil import move
+from subprocess import run, CalledProcessError, TimeoutExpired
 from time import perf_counter
 from typing import List
+
+import requests
 
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
@@ -45,33 +49,126 @@ class GEDICanopyHeight:
     def __repr__(self) -> str:
         return f'GEDICanopyHeight(source_directory="{self.source_directory}")'
 
+    @staticmethod
+    def _remote_file_size(URL: str, timeout: tuple[float, float] = (10.0, 30.0)) -> int | None:
+        try:
+            response = requests.head(URL, allow_redirects=True, timeout=timeout)
+            response.raise_for_status()
+        except requests.RequestException:
+            return None
+
+        content_length = response.headers.get("Content-Length")
+
+        if content_length is None:
+            return None
+
+        try:
+            return int(content_length)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _is_geotiff_readable(filename: str) -> bool:
+        try:
+            completed = run(
+                ["gdalinfo", filename],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+        except (OSError, TimeoutExpired):
+            return False
+
+        return completed.returncode == 0
+
+    def _is_valid_source_file(self, URL: str, filename_absolute: str) -> bool:
+        if not exists(filename_absolute):
+            return False
+
+        local_size = os.path.getsize(filename_absolute)
+        if local_size <= 0:
+            return False
+
+        remote_size = self._remote_file_size(URL)
+        if remote_size is not None and local_size != remote_size:
+            self.logger.warning(
+                "existing file size mismatch, expected %s but got %s: %s",
+                remote_size,
+                local_size,
+                filename_absolute,
+            )
+            return False
+
+        if not self._is_geotiff_readable(filename_absolute):
+            self.logger.warning("existing file is not readable GeoTIFF: %s", filename_absolute)
+            return False
+
+        return True
+
+    def _replace_invalid_file(self, filename_absolute: str) -> None:
+        corrupt_filename = f"{filename_absolute}.corrupt"
+
+        if exists(corrupt_filename):
+            os.remove(corrupt_filename)
+
+        move(filename_absolute, corrupt_filename)
+        self.logger.warning("replaced corrupt file: %s -> %s", filename_absolute, corrupt_filename)
+
     def download_file(self, URL: str, filename: str) -> str:
         filename_absolute = abspath(expanduser(filename))
 
-        print(filename_absolute, exists(filename_absolute))
-
-        if exists(filename_absolute):
+        if self._is_valid_source_file(URL=URL, filename_absolute=filename_absolute):
             self.logger.info(f"file already downloaded: {filename}")
             return filename
 
-        self.logger.info(f"downloading: {URL} -> {filename}")
-        directory = dirname(filename_absolute)
-        makedirs(directory, exist_ok=True)
-        partial_filename = f"{filename_absolute}.download"
-        # command = f'wget -c -O "{partial_filename}" "{URL}"'
-        download_start = perf_counter()
-        # system(command)
-        download(URL, partial_filename)
-        download_end = perf_counter()
-        download_duration = download_end - download_start
-        self.logger.info(f"completed download in {download_duration:0.2f} seconds: {filename}")
+        for attempt in range(2):
+            if exists(filename_absolute):
+                self._replace_invalid_file(filename_absolute)
 
-        if not exists(partial_filename):
-            raise IOError(f"unable to download URL: {URL}")
+            self.logger.info(f"downloading: {URL} -> {filename}")
+            directory = dirname(filename_absolute)
+            makedirs(directory, exist_ok=True)
+            partial_filename = f"{filename_absolute}.download"
 
-        move(partial_filename, filename_absolute)
+            if attempt > 0 and exists(partial_filename):
+                os.remove(partial_filename)
 
-        return filename
+            if exists(partial_filename):
+                partial_size = os.path.getsize(partial_filename)
+                remote_size = self._remote_file_size(URL)
+                if remote_size is not None and partial_size > remote_size:
+                    os.remove(partial_filename)
+
+            download_start = perf_counter()
+            try:
+                download(URL, partial_filename)
+            except Exception:
+                if attempt == 0:
+                    self.logger.warning("retrying failed source download from scratch: %s", filename_absolute)
+                    if exists(partial_filename):
+                        os.remove(partial_filename)
+                    continue
+                raise
+
+            download_end = perf_counter()
+            download_duration = download_end - download_start
+            self.logger.info(f"completed download in {download_duration:0.2f} seconds: {filename}")
+
+            if not exists(partial_filename):
+                raise IOError(f"unable to download URL: {URL}")
+
+            move(partial_filename, filename_absolute)
+
+            if self._is_valid_source_file(URL=URL, filename_absolute=filename_absolute):
+                return filename
+
+            self._replace_invalid_file(filename_absolute)
+
+            if attempt == 0:
+                self.logger.warning("retrying failed source download from scratch: %s", filename_absolute)
+
+        raise IOError(f"downloaded file failed validation and was quarantined: {filename_absolute}")
 
     @property
     def source_URLs(self) -> dict:
@@ -119,12 +216,38 @@ class GEDICanopyHeight:
     @property
     def VRT(self) -> str:
         if exists(self.VRT_filename):
-            return self.VRT_filename
+            try:
+                completed = run(
+                    ["gdalinfo", self.VRT_filename],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+            except TimeoutExpired:
+                completed = None
+
+            if completed is not None and completed.returncode == 0:
+                return self.VRT_filename
+
+            self.logger.warning("existing VRT is invalid or timed out and will be rebuilt: %s", self.VRT_filename)
+            corrupt_vrt = f"{self.VRT_filename}.corrupt"
+            if exists(corrupt_vrt):
+                os.remove(corrupt_vrt)
+            move(self.VRT_filename, corrupt_vrt)
 
         source_filenames = self.download_sources()
-        command = f"gdalbuildvrt {self.VRT_filename} {' '.join(source_filenames)}"
-        self.logger.info(command)
-        system(command)
+        command = ["gdalbuildvrt", self.VRT_filename, *source_filenames]
+        self.logger.info(" ".join(command))
+
+        try:
+            run(command, check=True, capture_output=True, text=True, timeout=300)
+        except FileNotFoundError as exc:
+            raise RuntimeError("gdalbuildvrt is required but was not found in PATH") from exc
+        except TimeoutExpired as exc:
+            raise TimeoutError("gdalbuildvrt timed out while building canopy height VRT") from exc
+        except CalledProcessError as exc:
+            raise RuntimeError(f"gdalbuildvrt failed: {exc.stderr.strip()}") from exc
 
         if not exists(self.VRT_filename):
             raise IOError(f"unable to produce canopy height VRT: {self.VRT_filename}")
